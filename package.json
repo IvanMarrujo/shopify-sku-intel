@@ -1,0 +1,7 @@
+{
+  "name": "shopify-sku-intel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" }
+}
