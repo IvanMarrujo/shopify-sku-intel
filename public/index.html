@@ -1249,7 +1249,7 @@ async function sendChat() {
   const thinking = addChatMsg('assistant', '...', true);
 
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const res = await fetch('/api/claude', {
       method: 'POST',
       headers: { 'Content-Type':'application/json' },
       body: JSON.stringify({
@@ -1331,7 +1331,7 @@ ${crit.slice(0,5).map(r=>`• ${r.product} — vel ${r.velocity.toFixed(1)}/día
 Estructura el brief con: situación actual, riesgos inmediatos, recomendaciones de acción por orden de urgencia. Que planing pueda leerlo en 90 segundos y saber exactamente qué pedir y en qué orden.`;
 
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const res = await fetch('/api/claude', {
       method: 'POST',
       headers: { 'Content-Type':'application/json' },
       body: JSON.stringify({
