@@ -516,6 +516,7 @@ const PROXY_BUNDLES = '/api/bundles';
 let allRows      = [];
 let filtered     = [];
 let rawSalesMap  = {};
+let weeklySalesMap = {};
 let explodedMap  = {};
 let knownSkus    = [];
 let currentTab   = 'all';
@@ -587,7 +588,8 @@ async function fetchAll() {
     const inventoryMap = await fetchInventory(shop, token, variants);
 
     const { salesMap, orderCount } = await fetchSales(shop, token, days);
-    rawSalesMap = salesMap;
+    weeklySalesMap = salesMap;
+    rawSalesMap = Object.fromEntries(Object.entries(salesMap).map(([sku,e])=>[sku,e.total]));
 
     setProgress(92,'Aplicando bundle decomposition...');
     await recomputeExploded();
@@ -659,14 +661,18 @@ async function fetchSales(shop, token, days) {
   for(let d=0;d<days;d+=CHUNK)
     chunks.push({from:new Date(now-Math.min(d+CHUNK,days)*86400000).toISOString(),to:new Date(now-d*86400000).toISOString()});
   setProgress(62,'Jalando órdenes en '+chunks.length+' chunks paralelos...');
-  const salesMap={}; let orderCount=0;
-  for(let i=0;i<chunks.length;i+=4){
+  // chunks[0] = most recent → semanas[0] = oldest, semanas[n-1] = most recent
+  const n=chunks.length, salesMap={}; let orderCount=0;
+  for(let i=0;i<n;i+=4){
     const results=await Promise.all(chunks.slice(i,i+4).map(c=>fetchSalesChunk(shop,token,c.from,c.to)));
-    for(const r of results){
+    results.forEach((r,j)=>{
       orderCount+=r.orderCount;
-      for(const [sku,qty] of Object.entries(r.salesMap))
-        salesMap[sku]=(salesMap[sku]||0)+qty;
-    }
+      const w=n-1-(i+j);
+      for(const [sku,qty] of Object.entries(r.salesMap)){
+        const e=salesMap[sku]||(salesMap[sku]={total:0,semanas:new Array(n).fill(0)});
+        e.total+=qty; e.semanas[w]+=qty;
+      }
+    });
     setProgress(Math.min(60+Math.round(((i+4)/chunks.length)*30),90),'Órdenes: '+orderCount+' procesadas...');
   }
   return {salesMap,orderCount};
@@ -954,13 +960,21 @@ function changePage(delta){
 }
 
 function exportCSV() {
-  const header=['SKU','Producto','Variante','Tipo','Stock','Vel/día','Días cobert.','Quiebre est.','Vendido dir.','Consumo total','Reposición sug.','Estado'];
+  const WEEKS=13;
+  const weekCols=Array.from({length:WEEKS},(_,k)=>'semana_'+String(k+1).padStart(2,'0'));
+  // Right-aligned: semana_13 is always the most recent week
+  const weeksFor=sku=>{
+    const s=weeklySalesMap[sku]?.semanas||[];
+    return Array.from({length:WEEKS},(_,k)=>s[s.length-WEEKS+k]??0);
+  };
+  const header=['SKU','Producto','Variante','Tipo','Stock','Vel/día','Días cobert.','Quiebre est.','Vendido dir.','Consumo total','Reposición sug.','Estado',...weekCols];
   const rows=filtered.map(r=>[
     r.sku,`"${r.product.replace(/"/g,'""')}"`,r.variant,r.type,r.stock,
     r.velocity.toFixed(2),r.daysCover>=9999?'∞':r.daysCover,
     r.stockoutDate?r.stockoutDate.toLocaleDateString('es-MX'):'—',
     r.soldDirect,r.soldTotal,r.reorderQty,
-    r.stock<=0?'Sin stock':r.daysCover<7&&r.velocity>0?'CRÍTICO':r.stock<5?'Bajo':'OK'
+    r.stock<=0?'Sin stock':r.daysCover<7&&r.velocity>0?'CRÍTICO':r.stock<5?'Bajo':'OK',
+    ...weeksFor(r.sku)
   ]);
   const csv=[header,...rows].map(r=>r.join(',')).join('\n');
   const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
