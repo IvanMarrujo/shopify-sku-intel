@@ -320,9 +320,14 @@ tbody td{padding:9px 10px;font-family:var(--mono);font-size:11px}
       <label>Access Token</label>
       <input id="accessToken" type="password" placeholder="shpat_xxxxxxxxxxxx"/>
     </div>
-    <div class="field" style="max-width:110px">
-      <label>Días historial</label>
-      <input id="histDays" type="number" value="7" min="1" max="365"/>
+    <div class="field" style="max-width:150px">
+      <label>Desde</label>
+      <input id="date_from" type="date"/>
+    </div>
+    <div class="field" style="max-width:150px">
+      <label>Hasta</label>
+      <input id="date_to" type="date"/>
+      <span id="rangeDays" style="font-size:11px;color:var(--muted);font-family:var(--mono)"></span>
     </div>
     <div class="field" style="max-width:110px">
       <label>Cobertura objetivo</label>
@@ -337,6 +342,7 @@ tbody td{padding:9px 10px;font-family:var(--mono);font-size:11px}
     <div class="dot dot-idle" id="statusDot"></div>
     <span id="statusText">En espera — ingresa credenciales y conecta</span>
   </div>
+  <div class="drift-alert" id="tokenCapWarning" style="display:none"></div>
 
   <div class="progress-wrap" id="progressWrap">
     <div class="progress-track"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
@@ -524,6 +530,7 @@ let page         = 1;
 let useExploded  = false;
 let pendingAnalysis = null;
 let fetchedDays  = 7;
+let fetchedWeeks = 0;
 const PER_PAGE   = 30;
 
 let bundleConfig = JSON.parse(localStorage.getItem('bundleConfig') || '[]');
@@ -554,11 +561,49 @@ function setProgress(pct, label) {
   if (pct >= 100) setTimeout(() => wrap.style.display = 'none', 800);
 }
 
+// ══ RANGO DE FECHAS ═════════════════════════════════════════════════════
+const DAY_MS = 86400000;
+function toDateInputValue(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function parseDateInput(id){
+  const v = document.getElementById(id).value;
+  if (!v) return null;
+  const [y,m,d] = v.split('-').map(Number);
+  return new Date(y, m-1, d);   // medianoche local
+}
+// {from, toEnd (exclusivo: medianoche del día después de date_to), days (inclusivo)} o null si es inválido
+function getRange(){
+  const from = parseDateInput('date_from'), to = parseDateInput('date_to');
+  if (!from || !to || from > to) return null;
+  return { from, toEnd: new Date(to.getFullYear(), to.getMonth(), to.getDate()+1), days: Math.round((to-from)/DAY_MS)+1 };
+}
+function updateRangeDays(){
+  const r = getRange();
+  document.getElementById('rangeDays').textContent = r ? r.days+' días seleccionados' : 'Rango inválido';
+}
+function initDateRange(){
+  const today = new Date();
+  const from  = new Date(today.getFullYear(), today.getMonth(), today.getDate()-60);
+  ['date_from','date_to'].forEach(id=>{
+    const el = document.getElementById(id);
+    el.max = toDateInputValue(today);
+    el.addEventListener('input', updateRangeDays);
+  });
+  document.getElementById('date_to').value   = toDateInputValue(today);
+  document.getElementById('date_from').value = toDateInputValue(from);
+  updateRangeDays();
+}
+initDateRange();
+
 // ══ PROXY ═══════════════════════════════════════════════════════════════
 async function shopifyGet(path, params, shop, token) {
   const qs  = new URLSearchParams({ path, ...params }).toString();
   const res = await fetch(PROXY_SHOPIFY+'?'+qs, { headers:{'x-shop':shop,'x-token':token} });
-  if (!res.ok) { const e = await res.json().catch(()=>{}); throw new Error(e?.error||'HTTP '+res.status); }
+  if (!res.ok) {
+    const e = await res.json().catch(()=>{});
+    const err = new Error(e?.error||'HTTP '+res.status);
+    err.status = res.status; err.retryAfter = res.headers.get('Retry-After');
+    throw err;
+  }
   return { data: await res.json(), linkHeader: res.headers.get('Link') };
 }
 
@@ -566,11 +611,14 @@ async function shopifyGet(path, params, shop, token) {
 async function fetchAll() {
   const shop  = document.getElementById('shopDomain').value.trim().replace(/\/$/,'');
   const token = document.getElementById('accessToken').value.trim();
-  const days  = parseInt(document.getElementById('histDays').value)||7;
-  fetchedDays = days;
+  const range = getRange();
   if (!shop||!token){ setStatus('error','Faltan credenciales'); return; }
+  if (!range){ setStatus('error','Rango de fechas inválido — "Desde" debe ser anterior o igual a "Hasta"'); return; }
+  const days  = range.days;
+  fetchedDays = days;
 
   document.getElementById('btnFetch').disabled = true;
+  document.getElementById('tokenCapWarning').style.display = 'none';
   document.getElementById('btnExport').style.display = 'none';
   document.getElementById('explodeToggleWrap').style.display = 'none';
   document.getElementById('bundleBanner').style.display = 'none';
@@ -587,8 +635,9 @@ async function fetchAll() {
     setProgress(35,variants.length+' variantes — jalando inventario...');
     const inventoryMap = await fetchInventory(shop, token, variants);
 
-    const { salesMap, orderCount } = await fetchSales(shop, token, days);
+    const { salesMap, orderCount, weeks, capWarning } = await fetchSales(shop, token, range);
     weeklySalesMap = salesMap;
+    fetchedWeeks = weeks;
     rawSalesMap = Object.fromEntries(Object.entries(salesMap).map(([sku,e])=>[sku,e.total]));
 
     setProgress(92,'Aplicando bundle decomposition...');
@@ -600,7 +649,13 @@ async function fetchAll() {
 
     renderDashboard(rows, orderCount, days);
     setProgress(100,'Listo');
-    setStatus('ok','✓ '+rows.length+' SKUs — '+orderCount+' órdenes — últimos '+days+'d');
+    const lastDay = new Date(range.toEnd - 1);
+    setStatus('ok','✓ '+rows.length+' SKUs — '+orderCount+' órdenes — '+range.from.toLocaleDateString('es-MX')+' → '+lastDay.toLocaleDateString('es-MX')+' ('+days+'d)');
+    if (capWarning) {
+      const w = document.getElementById('tokenCapWarning');
+      w.textContent = capWarning;
+      w.style.display = 'block';
+    }
     document.getElementById('headerMeta').textContent = shop+' · '+new Date().toLocaleString('es-MX');
     document.getElementById('btnExport').style.display = '';
     if (bundleConfig.length) document.getElementById('explodeToggleWrap').style.display = 'flex';
@@ -640,34 +695,56 @@ async function fetchInventory(shop, token, variants) {
 }
 
 async function fetchSalesChunk(shop, token, fromISO, toISO) {
-  const salesMap={}; let orderCount=0, cursor=null, hasNext=true;
+  const salesMap={}; let orderCount=0, oldestTs=Infinity, cursor=null, hasNext=true;
   while(hasNext){
-    const p={status:'any',created_at_min:fromISO,created_at_max:toISO,limit:250,fields:'line_items'};
+    const p={status:'any',created_at_min:fromISO,created_at_max:toISO,limit:250,fields:'line_items,created_at'};
     if(cursor) p.page_info=cursor;
     const {data,linkHeader}=await shopifyGet('/orders.json',p,shop,token);
     for(const o of (data.orders||[])){
       orderCount++;
+      const t=Date.parse(o.created_at);
+      if(t<oldestTs) oldestTs=t;
       for(const li of o.line_items)
         if(li.sku) salesMap[li.sku]=(salesMap[li.sku]||0)+li.quantity;
     }
     const next=(linkHeader||'').match(/<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"/);
     cursor=next?next[1]:null; hasNext=!!next;
   }
-  return {salesMap,orderCount};
+  return {salesMap,orderCount,oldestTs};
 }
 
-async function fetchSales(shop, token, days) {
-  const CHUNK=7, now=Date.now(), chunks=[];
-  for(let d=0;d<days;d+=CHUNK)
-    chunks.push({from:new Date(now-Math.min(d+CHUNK,days)*86400000).toISOString(),to:new Date(now-d*86400000).toISOString()});
+// Si Shopify responde 429, espera Retry-After (default 2s) y reintenta el chunk completo
+async function withRateLimitRetry(fn, maxRetries=5) {
+  for(let attempt=0;;attempt++){
+    try { return await fn(); }
+    catch(err){
+      if(err.status!==429||attempt>=maxRetries) throw err;
+      const waitMs=(parseFloat(err.retryAfter)||2)*1000;
+      console.warn('[fetchSales] 429 — reintentando chunk en '+waitMs+'ms (intento '+(attempt+1)+'/'+maxRetries+')');
+      await new Promise(r=>setTimeout(r,waitMs));
+    }
+  }
+}
+
+async function fetchSales(shop, token, range) {
+  // Trocea [date_from, date_to] en chunks de 7 días → chunks[0] = semana más antigua = semanas[0]
+  const CHUNK=7, chunks=[], f=range.from;
+  for(let d=0;d<range.days;d+=CHUNK){
+    const from=new Date(f.getFullYear(),f.getMonth(),f.getDate()+d);
+    const next=new Date(f.getFullYear(),f.getMonth(),f.getDate()+d+CHUNK);
+    const to=new Date(Math.min(next,range.toEnd)-1);   // fin inclusivo, sin traslape con el chunk siguiente
+    chunks.push({from:from.toISOString(),to:to.toISOString()});
+  }
   setProgress(62,'Jalando órdenes en '+chunks.length+' chunks paralelos...');
-  // chunks[0] = most recent → semanas[0] = oldest, semanas[n-1] = most recent
-  const n=chunks.length, salesMap={}; let orderCount=0;
+  const n=chunks.length, salesMap={}, chunkOrders=new Array(n).fill(0);
+  let orderCount=0, oldestTs=Infinity;
   for(let i=0;i<n;i+=4){
-    const results=await Promise.all(chunks.slice(i,i+4).map(c=>fetchSalesChunk(shop,token,c.from,c.to)));
+    const results=await Promise.all(chunks.slice(i,i+4).map(c=>withRateLimitRetry(()=>fetchSalesChunk(shop,token,c.from,c.to))));
     results.forEach((r,j)=>{
+      const w=i+j;
       orderCount+=r.orderCount;
-      const w=n-1-(i+j);
+      chunkOrders[w]=r.orderCount;
+      if(r.oldestTs<oldestTs) oldestTs=r.oldestTs;
       for(const [sku,qty] of Object.entries(r.salesMap)){
         const e=salesMap[sku]||(salesMap[sku]={total:0,semanas:new Array(n).fill(0)});
         e.total+=qty; e.semanas[w]+=qty;
@@ -675,7 +752,12 @@ async function fetchSales(shop, token, days) {
     });
     setProgress(Math.min(60+Math.round(((i+4)/chunks.length)*30),90),'Órdenes: '+orderCount+' procesadas...');
   }
-  return {salesMap,orderCount};
+  // Tope del token: las semanas más antiguas vienen en 0 pero hay datos en semanas más recientes
+  const firstWithData=chunkOrders.findIndex(c=>c>0);
+  const capWarning=firstWithData>0
+    ? 'El token devolvió datos desde '+new Date(oldestTs).toLocaleDateString('es-MX')+'. Las semanas anteriores salieron vacías — probable límite de scope del token.'
+    : null;
+  return {salesMap,orderCount,weeks:n,capWarning};
 }
 
 // ══ INTELLIGENCE ════════════════════════════════════════════════════════
@@ -960,13 +1042,9 @@ function changePage(delta){
 }
 
 function exportCSV() {
-  const WEEKS=13;
-  const weekCols=Array.from({length:WEEKS},(_,k)=>'semana_'+String(k+1).padStart(2,'0'));
-  // Right-aligned: semana_13 is always the most recent week
-  const weeksFor=sku=>{
-    const s=weeklySalesMap[sku]?.semanas||[];
-    return Array.from({length:WEEKS},(_,k)=>s[s.length-WEEKS+k]??0);
-  };
+  // Una columna por semana del rango: semana_01 = la más antigua
+  const weekCols=Array.from({length:fetchedWeeks},(_,k)=>'semana_'+String(k+1).padStart(2,'0'));
+  const weeksFor=sku=>weeklySalesMap[sku]?.semanas||new Array(fetchedWeeks).fill(0);
   const header=['SKU','Producto','Variante','Tipo','Stock','Vel/día','Días cobert.','Quiebre est.','Vendido dir.','Consumo total','Reposición sug.','Estado',...weekCols];
   const rows=filtered.map(r=>[
     r.sku,`"${r.product.replace(/"/g,'""')}"`,r.variant,r.type,r.stock,
@@ -985,6 +1063,7 @@ function exportCSV() {
 
 function clearData(){
   allRows=[];filtered=[];rawSalesMap={};explodedMap={};
+  document.getElementById('tokenCapWarning').style.display='none';
   ['statsRow','dataSection'].forEach(id=>document.getElementById(id).style.display='none');
   document.getElementById('emptyState').style.display='';
   document.getElementById('progressWrap').style.display='none';

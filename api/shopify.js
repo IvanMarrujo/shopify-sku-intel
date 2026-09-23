@@ -41,6 +41,9 @@ export default async function handler(req, res) {
     // Pasar Link header para paginación
     const linkHeader = upstream.headers.get('Link');
     if (linkHeader) res.setHeader('Link', linkHeader);
+    // Pasar Retry-After para que el frontend respete el rate limit (429)
+    const retryAfter = upstream.headers.get('Retry-After');
+    if (retryAfter) res.setHeader('Retry-After', retryAfter);
 
     const data = await upstream.json();
 
